@@ -11,40 +11,86 @@ const { promisify } = require("util");
 const { randomUUID } = require("crypto");
 
 const app = express();
-const exec = promisify(execFile);
-const TMP = os.tmpdir();
+const execFileAsync = promisify(execFile);
 
 app.use(helmet());
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "2mb" }));
+
+const PORT = process.env.PORT || 3000;
+
+// TEMPORARY STORAGE
+const tempDir = path.join(os.tmpdir(), "vinzz-downloader");
+
+if (!fs.existsSync(tempDir)) {
+  fs.mkdirSync(tempDir, { recursive: true });
+}
+
+// MULTER CONFIG
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, tempDir);
+  },
+  filename: (req, file, cb) => {
+    cb(null, randomUUID() + path.extname(file.originalname).toLowerCase());
+  }
+});
 
 const upload = multer({
-  dest: TMP,
-  limits: { fileSize: 200 * 1024 * 1024 },
+  storage,
+  limits: {
+    fileSize: 200 * 1024 * 1024
+  },
   fileFilter: (req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase();
     const allowed = [
       ".mp4", ".mov", ".webm", ".mkv",
       ".mp3", ".m4a", ".wav"
     ];
 
-    cb(null, allowed.includes(ext));
+    const ext = path.extname(file.originalname).toLowerCase();
+
+    if (!allowed.includes(ext)) {
+      return cb(new Error("Format file tidak didukung."));
+    }
+
+    cb(null, true);
   }
 });
+
+// PLATFORM DOMAIN CHECK
+function isAllowedDomain(host, platform) {
+  host = host.toLowerCase();
+
+  const domains = {
+    TikTok: ["tiktok.com"],
+    Instagram: ["instagram.com"],
+    YouTube: ["youtube.com", "youtu.be"]
+  };
+
+  const allowed = domains[platform];
+
+  if (!allowed) return false;
+
+  return allowed.some(domain =>
+    host === domain || host.endsWith("." + domain)
+  );
+}
 
 // HOME
 app.get("/", (req, res) => {
   res.json({
     name: "VINZZ DOWNLOADER API",
     status: "ONLINE",
-    version: "2.0.0",
-    features: ["Analyze Link", "MP3 Conversion", "MP4 Conversion"]
+    version: "2.1.0",
+    message: "Backend berhasil dijalankan."
   });
 });
 
 // HEALTH CHECK
 app.get("/health", (req, res) => {
-  res.json({ status: "healthy" });
+  res.json({
+    status: "healthy"
+  });
 });
 
 // ANALYZE LINK
@@ -59,24 +105,28 @@ app.post("/api/analyze", (req, res) => {
       });
     }
 
-    const parsed = new URL(url);
+    let parsed;
 
-    if (!["http:", "https:"].includes(parsed.protocol)) {
-      throw new Error("URL tidak valid.");
-    }
-
-    const host = parsed.hostname.toLowerCase();
-
-    const platforms = {
-      TikTok: ["tiktok.com", "www.tiktok.com", "vm.tiktok.com"],
-      Instagram: ["instagram.com", "www.instagram.com"],
-      YouTube: ["youtube.com", "www.youtube.com", "youtu.be"]
-    };
-
-    if (!platforms[platform] || !platforms[platform].includes(host)) {
+    try {
+      parsed = new URL(url);
+    } catch {
       return res.status(400).json({
         success: false,
-        error: "Link tidak sesuai platform."
+        error: "Format link tidak valid."
+      });
+    }
+
+    if (!["http:", "https:"].includes(parsed.protocol)) {
+      return res.status(400).json({
+        success: false,
+        error: "Protokol link tidak valid."
+      });
+    }
+
+    if (!isAllowedDomain(parsed.hostname, platform)) {
+      return res.status(400).json({
+        success: false,
+        error: "Link tidak sesuai platform yang dipilih."
       });
     }
 
@@ -92,104 +142,116 @@ app.post("/api/analyze", (req, res) => {
       message: "Link berhasil diperiksa.",
       platform,
       format,
-      nextStep: "Gunakan fitur unduh atau ekspor resmi platform."
+      nextStep: "Link sudah lolos pemeriksaan domain. Pengunduhan belum tersedia pada backend ini. Gunakan fitur ekspor resmi atau media yang kamu punya izin untuk proses."
     });
 
   } catch (error) {
-    res.status(400).json({
+    console.error("ANALYZE ERROR:", error);
+
+    res.status(500).json({
       success: false,
-      error: "Link tidak valid."
+      error: "Terjadi kesalahan pada server."
     });
   }
 });
 
-// FILE CONVERSION
+// CONVERT MEDIA YANG DIUNGGAH
 app.post("/api/convert", upload.single("file"), async (req, res) => {
-  let input;
-  let output;
+  let inputPath;
+  let outputPath;
 
   try {
     if (!req.file) {
       return res.status(400).json({
-        error: "File tidak tersedia atau format tidak didukung."
+        success: false,
+        error: "File belum dipilih."
       });
     }
 
-    input = req.file.path;
+    inputPath = req.file.path;
 
-    const ext = path.extname(req.file.originalname).toLowerCase();
     const format = String(req.body.format || "").toLowerCase();
 
     if (!["mp3", "mp4"].includes(format)) {
-      throw new Error("Format harus MP3 atau MP4.");
+      fs.unlink(inputPath, () => {});
+
+      return res.status(400).json({
+        success: false,
+        error: "Format harus MP3 atau MP4."
+      });
     }
 
-    if (format === "mp4" &&
-        [".mp3", ".m4a", ".wav"].includes(ext)) {
-      throw new Error("Sumber tidak memiliki video.");
-    }
-
-    output = path.join(TMP, randomUUID() + "." + format);
+    outputPath = path.join(
+      tempDir,
+      randomUUID() + "." + format
+    );
 
     const args = format === "mp3"
       ? [
-          "-y", "-i", input,
-          "-vn", "-codec:a", "libmp3lame",
-          "-b:a", "192k", output
+          "-y",
+          "-i", inputPath,
+          "-vn",
+          "-codec:a", "libmp3lame",
+          "-q:a", "2",
+          outputPath
         ]
       : [
-          "-y", "-i", input,
+          "-y",
+          "-i", inputPath,
           "-c:v", "libx264",
-          "-preset", "veryfast",
-          "-crf", "23",
           "-c:a", "aac",
           "-movflags", "+faststart",
-          output
+          outputPath
         ];
 
-    await exec("ffmpeg", args, { timeout: 180000 });
+    await execFileAsync("ffmpeg", args, {
+      timeout: 10 * 60 * 1000
+    });
 
-    const filename = "VINZZ-" + randomUUID() + "." + format;
-
-    res.download(output, filename, () => {
-      if (input) fs.promises.unlink(input).catch(() => {});
-      if (output) fs.promises.unlink(output).catch(() => {});
+    res.download(outputPath, "VINZZ-CONVERT." + format, () => {
+      fs.unlink(inputPath, () => {});
+      fs.unlink(outputPath, () => {});
     });
 
   } catch (error) {
-    console.error("CONVERSION ERROR:", error.message);
+    console.error("CONVERT ERROR:", error);
 
-    if (input) fs.promises.unlink(input).catch(() => {});
-    if (output) fs.promises.unlink(output).catch(() => {});
+    if (inputPath) fs.unlink(inputPath, () => {});
+    if (outputPath) fs.unlink(outputPath, () => {});
 
     if (!res.headersSent) {
       res.status(500).json({
-        error: "Pemrosesan gagal. Periksa file dan format."
+        success: false,
+        error: "Konversi gagal. Periksa file dan coba lagi."
       });
     }
   }
 });
 
 // ERROR HANDLER
-app.use((err, req, res, next) => {
-  console.error(err.message);
+app.use((error, req, res, next) => {
+  console.error("SERVER ERROR:", error.message);
 
-  if (err.code === "LIMIT_FILE_SIZE") {
-    return res.status(413).json({
-      error: "Ukuran file maksimal 200 MB."
+  if (error instanceof multer.MulterError) {
+    return res.status(400).json({
+      success: false,
+      error: error.code === "LIMIT_FILE_SIZE"
+        ? "Ukuran file maksimal 200 MB."
+        : "Upload file gagal."
     });
   }
 
   res.status(400).json({
-    error: "Permintaan tidak dapat diproses."
+    success: false,
+    error: error.message || "Terjadi kesalahan."
   });
 });
 
 // START SERVER
-const PORT = process.env.PORT || 3000;
-
 app.listen(PORT, "0.0.0.0", () => {
-  console.log("VINZZ DOWNLOADER API running on port " + PORT);
+  console.log("VINZZ DOWNLOADER API ONLINE");
+  console.log("PORT:", PORT);
 });
+
 
 
